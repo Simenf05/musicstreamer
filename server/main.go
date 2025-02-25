@@ -1,10 +1,11 @@
 package main
 
 import (
-    "bytes"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -49,25 +50,9 @@ func (downloader *Downloader) download(url string) {
 }
 
 type Connection struct {
+    id int
     buffer chan []byte
     stop chan bool
-}
-
-
-
-func (conn *Connection) stream(url string) {
-
-    go downloadFile(url, conn.buffer)
-    ticker := time.NewTicker(150 * time.Millisecond)
-
-    for range ticker.C {
-        select {
-            case <-conn.stop:
-                return
-            default:
-                continue
-        }
-    }
 }
 
 type ConnectionContainer struct {
@@ -75,14 +60,14 @@ type ConnectionContainer struct {
     mu sync.Mutex
 }
 
-func (container *ConnectionContainer) newConnection() *Connection {
+func (container *ConnectionContainer) newConnection(id int) *Connection {
     defer container.mu.Unlock()
     container.mu.Lock()
 
-    newConn := Connection{buffer: make(chan []byte, 100)}
+    newConn := Connection{buffer: make(chan []byte, 100), id: id}
     container.connections[newConn] = struct{}{}
 
-    log.Println("Starting connection")
+    log.Printf("Starting connection with id: %d", id)
 
     return &newConn
 }
@@ -92,72 +77,67 @@ func (container *ConnectionContainer) removeConnection(connection *Connection) {
     container.mu.Lock()
 
     if _, ok := container.connections[*connection]; ok {
-        log.Println("Removing connection")
+        log.Printf("Removing connection with id: %d", connection.id)
         delete(container.connections, *connection)
     }
 }
 
-func (connContainer *ConnectionContainer) distributer (music chan []byte) {
-    ticker := time.NewTicker(150 * time.Millisecond)
-    tempBuffer := make([]byte, 8192)
-    tempFile := bytes.NewReader(<-music)
-
-    for range ticker.C {
-        tempFile.Read(tempBuffer)
-        for conn := range connContainer.connections {
-            conn.buffer <- tempBuffer
-        }
-    }
-}
-
-func downloadFile(url string, music chan []byte) {
-
-    resp, err := http.Get(url)
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    defer resp.Body.Close()
-    body, err := io.ReadAll(resp.Body)
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    music <- body
-}
-
 
 func main() {
+    log.Println("Starting the server.")
 
     container := &ConnectionContainer{
         connections: make(map[Connection]struct{}),
     }
 
-    // music := make(chan []byte)
-
-    url := "https://ncsmusic.s3.eu-west-1.amazonaws.com/tracks/000/001/759/invincible-sped-up-1727366457-RfLWTl9BNp.mp3"
-    // go downloadFile(url, music)
-    // go container.distributer(music)
-
     http.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
 
-        // http.Get(w)
+        url := "https://ncs.io/music-search?q=%s&genre=%s&mood=%s"
+
+        name := r.URL.Query().Get("name")
+        genre := r.URL.Query().Get("genre")
+        mood := r.URL.Query().Get("mood")
+
+        url = fmt.Sprintf(url, name, genre, mood)
+        
+        resp, err := http.Get(url)
+        if err != nil {
+            log.Fatal(err)
+        }
+        defer resp.Body.Close()
+
+        body, err := io.ReadAll(resp.Body)
+        if err != nil {
+            log.Fatal(err)
+        }
+
+        // data-url="https://ncsmusic.s3.eu-west-1.amazonaws.com/tracks/000/001/127/on-on-nuumi-remix-1652349640-5EszNOOTne.mp3"
+        // in the html this is the grep for url of all the songs relevant to the search
+        regexpattern := regexp.MustCompile(`data-url="https:\/\/ncsmusic\.s3\.eu-west-1\.amazonaws\.com\/tracks\/\d{3}\/\d{3}\/\d{3}\/[\w\-]+\.mp3"`)
+
+        matches := regexpattern.FindAll(body, -1)
+
+        log.Printf("%q\n", matches)
+
+        w.Write()
 
     })
 
+    nextId := 0
     http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        url := "https://ncsmusic.s3.eu-west-1.amazonaws.com/tracks/000/001/759/invincible-sped-up-1727366457-RfLWTl9BNp.mp3"
 
         w.Header().Add("Content-Type", "audio/mpeg")
         w.Header().Add("Connection", "keep-alive")
 
         flusher, ok := w.(http.Flusher)
         if !ok {
-            log.Fatal(ok)
-            // log.Println(ok)
-            // return
+            log.Println(ok)
+            return
         }
 
-        conn := container.newConnection()
+        conn := container.newConnection(nextId)
+        nextId += 1
 
         downloader := Downloader{
             output: conn.buffer,
@@ -173,7 +153,7 @@ func main() {
 
             _, err := w.Write(message)
             if err != nil {
-                log.Printf("Stopping connection with error: %s", err)
+                log.Printf("Stopping connection with id: %d with error: %s", conn.id, err)
                 container.removeConnection(conn)
                 downloader.stop <- true
                 return
